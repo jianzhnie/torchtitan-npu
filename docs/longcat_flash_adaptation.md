@@ -135,63 +135,84 @@ python3 -m torchtitan_npu.entry \
 |------|-----|
 | 模型 | debug_8npu (128 experts, 2 layers) |
 | 参数量 | 12.5B |
-| 并行策略 | EP=8 + FSDP + AC(full) |
-| Loss (20步) | 12.35 → 7.31 |
-| 内存/卡 | 38.78 GiB (63.3%) |
-| 速度 | ~2.65s/step |
-| TFLOPS | 110 |
-| MFU | 31% |
+| 并行策略 | EP=8 + FSDP + AC(full) + npu_rms_norm + npu_moe_dispatch |
+| Loss (10步) | 12.31 → 8.30 |
+| 内存/卡 | 37.69 GiB (61.5%) |
+| 速度 | ~2.56s/step |
+| TFLOPS | 114 |
+| MFU | 32.3% |
+
+## 已实施的性能优化
+
+### 1. 融合 w1+w3→w13 + npu_swiglu
+
+将 gate_proj 和 up_proj 融合为单个 w13 参数，配合 `torch_npu.npu_swiglu` 做融合 SiLU+Gate 激活：
+- 3 次 `grouped_mm` 减少为 2 次
+- 减少 33% 的专家计算内存读取
+
+### 2. NPU RMSNorm (`npu_rms_norm` converter)
+
+使用 torchtitan 公共 `nn.RMSNorm`，通过 converter 自动替换为 `torch_npu.npu_rms_norm` 硬件加速算子，覆盖模型中所有 norm 层。
+
+### 3. NPU MoE Token Dispatch
+
+使用 `torch_npu.npu_moe_token_permute` / `torch_npu.npu_moe_token_unpermute` 替代 Python 级别的 argsort + scatter_add：
+- Token routing 计算完全下推到 NPU
+- 内存节省约 1 GiB/卡
+
+### 4. Tensor Parallel for MLA
+
+实现 MLA 注意力的张量并行：
+- `q_b_proj` / `kv_b_proj`: ColwiseParallel（按 head 维度分片）
+- `o_proj`: RowwiseParallel（all-reduce 聚合）
+- `q_a_proj` / `kv_a_proj_with_mqa` / layernorms: NoParallel（低秩压缩层不分片）
+- FFN 的 `gate_proj`/`up_proj`: ColwiseParallel, `down_proj`: RowwiseParallel
+- 所有 norm 层: SequenceParallel
 
 ## 未来可优化方向
 
 ### 高优先级
 
-1. **Tensor Parallel for MLA**
-   - 当前 TP 未实现（`NotImplementedError`）
-   - 参考 `deepseek_v32/parallelize.py` 的 `apply_non_moe_tp()` 实现 MLA 的 TP plan
-   - 需要对 `q_a_proj`、`kv_a_proj_with_mqa`、`kv_b_proj`、`o_proj` 分别配置 ColwiseParallel/RowwiseParallel
-   - 预期收益：单卡内存减半，支持更大模型
-
-2. **NPU MoE Dispatch (`npu_moe_dispatch`)**
-   - 当前使用 Python 级别的 argsort + scatter_add 做 token routing
-   - 可替换为 `torch_npu.npu_moe_token_permute` / `torch_npu.npu_moe_token_unpermute`
-   - 需要让 `LongCatFlashMoE` 兼容 `NpuExpertParallel`（EP 的 rerouting 用 `npu_moe_re_routing`）
-   - 预期收益：token dispatch 速度提升 2-3x
-
-3. **NPU RoPE (`npu_rope`)**
+1. **NPU RoPE (`npu_rope`)**
    - 当前使用 Python 实现的 `apply_rotary_pos_emb_mla`
-   - MLA 的 RoPE 采用 interleaved 排列后 apply cos/sin，可适配 `torch_npu.npu_rotary_mul`
-   - 需要调整 reshape 顺序使其符合 `npu_rotary_mul` 的输入格式
+   - MLA 的 RoPE 使用 doubled cos/sin 格式 `(seq, 2*dim)`，与 `npu_rotary_mul` 要求的 `(seq, dim//2)` 不兼容
+   - 需要重构 RoPE 预计算为 non-doubled 格式，并使用 `npu_rotary_mul` 的 default mode
    - 预期收益：RoPE 计算加速 ~50%
+
+2. **NpuExpertParallel 替换 ExpertParallel**
+   - 当前 EP 使用 vanilla `ExpertParallel`，all-to-all dispatch 走 Python
+   - 可用 `NpuExpertParallel` 的 `npu_moe_re_routing` 做 EP rerouting
+   - 需要在 parallelize.py 中将 `ExpertParallel()` 替换为 `NpuExpertParallel()`
+   - 预期收益：EP 通信与计算 overlap
 
 ### 中优先级
 
-4. **torch.compile 细粒度编译**
+3. **torch.compile 细粒度编译**
    - 参考 deepseek_v32 的 `apply_compile()`：对 MoE 子模块、attention 子模块分别编译
    - 排除 experts（grouped_mm 不支持 dynamo）和 NPURMSNorm
    - 预期收益：非 MoE 部分的 kernel fusion 提升 10-20%
 
-5. **MLA Absorb 优化**
+4. **MLA Absorb 优化**
    - 参考 deepseek_v32 的 `enable_mla_absorb` 模式
    - 将 `kv_b_proj` 权重分解为 `w_uk` 和 `w_uv`，通过 einsum 吸收到 Q 和 output
    - 减少 KV cache 大小和 attention 计算量
    - 预期收益：attention 显存减少 ~40%
 
-6. **512 专家全量支持**
+5. **512 专家全量支持**
    - 当前 8 卡最多训练 128 专家（受 HBM 限制）
    - 512 专家需要 16+ 卡（EP=16）或 EP=8 + FSDP=2（16 卡）
    - 或实现 CPU offload + prefetch 的流水线方案
 
 ### 低优先级
 
-7. **量化 GMM (`npu_quant_gmm`)**
+6. **量化 GMM (`npu_quant_gmm`)**
    - 支持 MXFP8 / HiFloat8 精度的 grouped matmul
    - 进一步减少专家计算的内存和算力消耗
 
-8. **Context Parallel**
+7. **Context Parallel**
    - 支持超长序列训练（>32K）
    - 需要在 attention 层引入 Ulysses 或 Ring 风格的 CP
 
-9. **Pipeline Parallel**
+8. **Pipeline Parallel**
    - 对完整 28 层模型做 PP 切分
    - 配合 `pipeline_llm` pipelining_fn 使用

@@ -174,6 +174,7 @@ class LongCatFlashExperts(Module):
 
     def forward(
         self, x_RD: torch.Tensor, num_tokens_per_expert: torch.Tensor,
+        routed_scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int64)
         w13 = _to_local(self.w13)
@@ -187,6 +188,8 @@ class LongCatFlashExperts(Module):
         except ImportError:
             half = h.shape[-1] // 2
             h = F.silu(h[..., :half]) * h[..., half:]
+        if routed_scores is not None:
+            h = h * routed_scores.to(h.dtype)
         return torch._grouped_mm(
             h, w2.bfloat16().transpose(-2, -1), offs=offsets
         ).type_as(x_RD)
@@ -248,6 +251,41 @@ class LongCatFlashMoE(Module):
         real_ids = topk_indices.clone()
         real_ids[identity_mask] = 0
 
+        try:
+            import torch_npu
+            routed_input, sorted_indices = torch_npu.npu_moe_token_permute(
+                x_flat.bfloat16(), real_ids.to(torch.int64)
+            )
+
+            num_tokens_per_expert = torch.histc(
+                real_ids.float(),
+                bins=self.num_real_experts,
+                min=0,
+                max=self.num_real_experts - 1,
+            ).int()
+
+            with torch.no_grad():
+                self.tokens_per_expert.add_(num_tokens_per_expert.float())
+
+            routed_output = self.experts(
+                routed_input, num_tokens_per_expert
+            )
+            unpermuted = torch_npu.npu_moe_token_unpermute(
+                routed_output.bfloat16(), sorted_indices,
+                probs=real_weights.bfloat16(),
+            )
+            expert_out = unpermuted.to(x_flat.dtype)
+        except ImportError:
+            expert_out = self._dispatch_python(x_flat, real_ids, real_weights)
+
+        out = expert_out + identity_out
+        return out.view(orig_shape)
+
+    def _dispatch_python(
+        self, x_flat: torch.Tensor, real_ids: torch.Tensor, real_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fallback Python dispatch when torch_npu is not available."""
+        dim = x_flat.shape[-1]
         expert_ids_flat = real_ids.view(-1)
         scores_flat = real_weights.view(-1)
         sorted_perm = expert_ids_flat.argsort(stable=True)
@@ -268,7 +306,7 @@ class LongCatFlashMoE(Module):
         routed_output = self.experts(routed_input, num_tokens_per_expert)
         routed_output = (
             routed_output.float() * sorted_scores.unsqueeze(-1)
-        ).to(x.dtype)
+        ).to(x_flat.dtype)
 
         out = torch.zeros_like(x_flat)
         out.scatter_add_(
@@ -276,7 +314,7 @@ class LongCatFlashMoE(Module):
             token_indices.unsqueeze(-1).expand(-1, dim),
             routed_output,
         )
-        out = out + identity_out
+        return out
         return out.view(orig_shape)
 
 
