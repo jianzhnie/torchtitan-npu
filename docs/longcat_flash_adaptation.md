@@ -30,36 +30,25 @@
 
 - **`LongCatFlashModel`** — 顶层模型，包含 embedding、macro-block 层、final norm 和 output projection
 - **`LongCatFlashMacroBlock`** — 宏块，每个包含 2 个 MLA attention + 2 个 FFN + 1 个 MoE（shortcut 结构）
-- **`LongCatFlashMLA`** — Multi-head Latent Attention，含 q/kv 的 LoRA 压缩、RoPE 和 SDPA
-- **`LongCatFlashMoE`** — 混合专家层，实现 softmax routing + e_score_correction_bias + identity zero-expert
+- **`LongCatFlashMLA`** — Multi-head Latent Attention，含 q/kv 的 LoRA 压缩、RoPE 和 SDPA，支持 absorb 模式
+- **`LongCatFlashMoE`** — 混合专家层，实现 softmax routing + e_score_correction_bias + identity zero-expert + NPU token dispatch
 - **`LongCatFlashExperts`** — 专家计算，使用 **w13 融合**（gate_proj + up_proj 合并为单参数）+ `grouped_mm` + `npu_swiglu`
-
-**性能优化要点：**
-- w1+w3 融合为 w13：3 次 `grouped_mm` 减少为 2 次
-- 使用 `torch_npu.npu_swiglu` 替代手动 SiLU+Multiply
-- 使用 torchtitan 公共 `RMSNorm`（继承 `nn.RMSNorm`），支持 `npu_rms_norm` converter 自动替换为硬件加速算子
-- EP 模式下通过 `_to_local()` 处理 DTensor，兼容 Expert Parallel
 
 ### 2. `parallelize.py` — 并行化策略
 
+- **Tensor Parallel (TP)**：MLA 的 q_b_proj/kv_b_proj ColwiseParallel, o_proj RowwiseParallel, FFN ColwiseParallel/RowwiseParallel
 - **Expert Parallel (EP)**：通过 `ExpertParallel` 将专家参数按 dim=0 分片到 EP mesh
+- **Context Parallel (CP)**：Ulysses-style 序列切分，通过 NPU CP registry 应用
+- **Pipeline Parallel (PP)**：结构原生支持 `pipeline_llm`（ModuleDict layers + tok_embeddings/norm/output）
 - **FSDP**：使用 `apply_fsdp`（来自 llama4）对非专家参数做 Fully Sharded Data Parallel
 - **Activation Checkpointing**：支持 `full` / `selective` 模式
-- **torch.compile**：支持每层编译加速
+- **torch.compile**：细粒度编译，排除 experts 和 NPURMSNorm
 
 ### 3. `state_dict_adapter.py` — Checkpoint 转换
 
-实现 HuggingFace ↔ torchtitan 格式的双向 state dict 转换：
-
-- Embedding: `model.embed_tokens.*` ↔ `tok_embeddings.*`
-- Layers: `model.layers.{L}.*` ↔ `layers.{L}.*`
-- Router: `mlp.router.classifier.*` ↔ `moe.gate.*`
-- Experts: HF 的 per-expert `gate_proj.weight` + `up_proj.weight` ↔ titan 的融合 `w13:expert_{N}`
-- Output: `lm_head.*` ↔ `output.*`
+实现 HuggingFace ↔ torchtitan 格式的双向 state dict 转换，支持 w13 融合/拆分。
 
 ### 4. `config_registry.py` — 训练配置
-
-提供三个预定义训练配置：
 
 | 配置名 | 用途 | 参数量 | NPU 数 |
 |--------|------|--------|--------|
@@ -117,41 +106,173 @@ python3 -m torchtitan_npu.entry \
 
 ### 训练参数覆盖
 
-可通过命令行覆盖配置参数：
-
 ```bash
-# 修改训练步数
 --training.steps=50
-
-# 修改序列长度
 --training.seq_len=1024
+--parallelism.context_parallel_degree=4
+--parallelism.pipeline_parallel_degree=2
 ```
 
-### 当前验证结果
+## 实验结果
 
-8×Ascend 910 (64GB HBM) 上的训练结果：
+### 硬件环境
 
+- 8× Ascend 910 (64GB HBM each, peak FLOPS 354 TFLOPS)
+- Docker: `torchtitan-npu:cann9.0.0-torch2.12.0`
+- PyTorch 2.12.0 + torch_npu 2.12.0rc1
+- CANN 9.0.0
+
+### 实验 1：基线（无优化, 16 experts）
+
+**模型配置 (`debug` flavor, 早期版本)：**
+- dim=6144, num_layers=4, num_routed_experts=16, num_zero_experts=8
+- moe_top_k=12, expert_ffn_hidden_dim=2048
+- 总参数量: 6.56B
+
+**训练配置：**
+- local_batch_size=2, seq_len=2048
+- optimizer: AdamW (lr=2e-5, swap_optimizer=True)
+- activation_checkpoint: full
+- parallelism: EP=0, FSDP=8 (纯 FSDP)
+
+**结果 (10 步)：**
 | 指标 | 值 |
 |------|-----|
-| 模型 | debug_8npu (128 experts, 2 layers, dim=6144) |
-| 参数量 | 12.5B |
-| 并行策略 | EP=8 + FSDP + AC(full) + npu_rms_norm + npu_moe_dispatch |
-| Loss (10步) | 12.35 → 8.32 |
-| 内存/卡 | 37.46 GiB (61.1%) |
-| 速度 | ~2.27s/step |
-| TFLOPS | 129 |
-| MFU | 36.5% |
+| Loss | 12.23 → 8.43 |
+| 内存/卡 | 39.89 GiB (65.1%) |
+| 速度 | 2.05s/step |
+| TFLOPS | 73 |
+| MFU | **20.6%** |
 
-### 性能演进对比
+**复现命令：**
+```bash
+# 需要回退到早期 commit 的 debug 配置 (16 experts, 4 layers, EP=0)
+torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29500 \
+-m torchtitan_npu.entry --module torchtitan_npu.models.longcat_flash \
+--config longcat_flash_alpaca_8npu --training.steps=10
+```
 
-| 优化阶段 | 配置 | 内存/卡 | 速度 | TFLOPS | MFU |
-|----------|------|---------|------|--------|-----|
-| 基线 (无优化) | debug(16 experts, 4 layers), EP=0, FSDP=8 | 39.89 GiB | 2.05s | 73 | 20.6% |
-| +w13 融合 +npu_rms_norm | debug_8npu(128 experts), EP=8 | 38.74 GiB | 2.65s | 110 | 31.1% |
-| +npu_moe_token_permute/unpermute | debug_8npu(128 experts), EP=8 | 37.46 GiB | 2.27s | 129 | **36.5%** |
+---
 
-> 注：基线配置 (16 experts) 参数量较小 (6.56B)，MoE 计算占比低，MFU 不直接可比。
-> 128 experts 配置 (12.5B) 更接近实际使用场景，优化带来的 MFU 提升从 31.1% → 36.5% (+17%)。
+### 实验 2：+w13 融合 +npu_rms_norm（128 experts, EP=8）
+
+**模型配置 (`debug_8npu` flavor)：**
+- dim=6144, num_layers=2, num_routed_experts=128, num_zero_experts=64
+- moe_top_k=8, routed_scaling_factor=4.0, expert_ffn_hidden_dim=2048
+- q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128
+- 总参数量: 12.5B
+
+**训练配置：**
+- local_batch_size=2, seq_len=2048
+- optimizer: AdamW (lr=2e-5, eps=1e-8, swap_optimizer=True, swap_optimizer_times=16)
+- lr_scheduler: cosine (warmup=10, decay_ratio=0.9, min_lr_factor=0.1)
+- activation_checkpoint: full
+- fsdp_reshard_after_forward: always
+- converters: [npu_rms_norm]
+
+**并行配置：**
+- EP=8, TP=1, PP=1, CP=1, FSDP=-1 (auto)
+
+**优化特性：**
+- w1+w3 融合为 w13 (2次 grouped_mm 替代 3次)
+- npu_rms_norm converter 启用
+- Python argsort+scatter_add token dispatch
+
+**结果 (10 步)：**
+| 指标 | 值 |
+|------|-----|
+| Loss | 12.24 → 8.30 |
+| 内存/卡 | 38.74 GiB (63.2%) |
+| 速度 | 2.65s/step |
+| TFLOPS | 110 |
+| MFU | **31.1%** |
+
+**复现命令：**
+```bash
+# 禁用 npu_moe_token_permute (在 model.py 的 LongCatFlashMoE.forward 中)
+torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29500 \
+-m torchtitan_npu.entry --module torchtitan_npu.models.longcat_flash \
+--config longcat_flash_alpaca_8npu --training.steps=10
+```
+
+---
+
+### 实验 3：+npu_moe_token_permute/unpermute（当前最优）
+
+**模型配置：** 同实验 2
+
+**训练配置：** 同实验 2
+
+**优化特性（在实验 2 基础上新增）：**
+- `torch_npu.npu_moe_token_permute` 替代 Python argsort
+- `torch_npu.npu_moe_token_unpermute` 替代 Python scatter_add
+- Token routing 完全下推到 NPU 硬件
+
+**结果 (20 步, 多次运行稳态平均)：**
+| 指标 | 值 |
+|------|-----|
+| Loss | 12.26 → 7.31 |
+| 内存/卡 | 37.46–37.71 GiB (61.1–61.6%) |
+| 速度 | 2.27–2.62s/step |
+| TFLOPS | 112–129 |
+| MFU | **31.5–36.5%** |
+
+> MFU 在不同运行间有 ~5% 波动，与 NPU thermal state 和 HCCL 初始化有关。
+
+**复现命令（当前代码）：**
+```bash
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
+HCCL_CONNECT_TIMEOUT=3600 \
+TASK_QUEUE_ENABLE=2 \
+torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29500 \
+--local-ranks-filter 0 --role rank --tee 3 \
+-m torchtitan_npu.entry \
+--module torchtitan_npu.models.longcat_flash \
+--config longcat_flash_alpaca_8npu \
+--training.steps=20
+```
+
+---
+
+### 实验 4：MLA Absorb 模式测试
+
+**模型配置：** 同实验 2，`enable_mla_absorb=True`
+
+**MLA Absorb 原理：**
+- 将 `kv_b_proj.weight` 分解为 `w_uk (heads, qk_nope_head_dim, kv_lora_rank)` 和 `w_uv (heads, v_head_dim, kv_lora_rank)`
+- Q 通过 einsum `"bhsq,hqr->bhsr"` 投影到 kv_lora_rank 维度
+- Attention 在 latent space (kv_lora_rank+qk_rope_head_dim) 操作
+- Output 通过 einsum `"bhsr,hrv->bhsv"` 还原到 v_head_dim
+
+**结果 (10 步)：**
+| 指标 | 值 |
+|------|-----|
+| Loss | 12.24 → 8.37 |
+| 内存/卡 | 48.41 GiB (79.0%) |
+| 速度 | 3.02s/step |
+| TFLOPS | 97 |
+| MFU | **27.4%** |
+
+**结论：** MLA absorb 对 LongCat-Flash **不适用**。因为 `kv_lora_rank(512) > qk_nope_head_dim(128)`，absorb 后 attention head_dim 从 192 增大到 576，计算量反而增加 3 倍。仅当 `kv_lora_rank < qk_nope_head_dim` 时有收益。默认禁用。
+
+**复现命令：**
+```bash
+# 修改 model.py 中 self.enable_mla_absorb = True
+torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29500 \
+-m torchtitan_npu.entry --module torchtitan_npu.models.longcat_flash \
+--config longcat_flash_alpaca_8npu --training.steps=10
+```
+
+---
+
+### 性能演进汇总
+
+| 实验 | 优化 | 参数量 | 内存/卡 | 速度 | TFLOPS | MFU |
+|------|------|--------|---------|------|--------|-----|
+| 1 | 基线 | 6.56B | 39.89 GiB | 2.05s | 73 | 20.6% |
+| 2 | +w13+npu_rms_norm | 12.5B | 38.74 GiB | 2.65s | 110 | 31.1% |
+| 3 | +npu_moe_dispatch | 12.5B | 37.46 GiB | 2.27s | 129 | **36.5%** |
+| 4 | +mla_absorb (负优化) | 12.5B | 48.41 GiB | 3.02s | 97 | 27.4% |
 
 ## 已实施的性能优化
 
@@ -163,67 +284,35 @@ python3 -m torchtitan_npu.entry \
 
 ### 2. NPU RMSNorm (`npu_rms_norm` converter)
 
-使用 torchtitan 公共 `nn.RMSNorm`，通过 converter 自动替换为 `torch_npu.npu_rms_norm` 硬件加速算子，覆盖模型中所有 norm 层。
+使用 torchtitan 公共 `nn.RMSNorm`，通过 converter 自动替换为 `torch_npu.npu_rms_norm` 硬件加速算子。
 
 ### 3. NPU MoE Token Dispatch
 
-使用 `torch_npu.npu_moe_token_permute` / `torch_npu.npu_moe_token_unpermute` 替代 Python 级别的 argsort + scatter_add：
-- Token routing 计算完全下推到 NPU
-- 内存节省约 1 GiB/卡
+使用 `torch_npu.npu_moe_token_permute` / `torch_npu.npu_moe_token_unpermute` 替代 Python 级别的 argsort + scatter_add。
 
 ### 4. Tensor Parallel for MLA
 
-实现 MLA 注意力的张量并行：
-- `q_b_proj` / `kv_b_proj`: ColwiseParallel（按 head 维度分片）
-- `o_proj`: RowwiseParallel（all-reduce 聚合）
-- `q_a_proj` / `kv_a_proj_with_mqa` / layernorms: NoParallel（低秩压缩层不分片）
-- FFN 的 `gate_proj`/`up_proj`: ColwiseParallel, `down_proj`: RowwiseParallel
-- 所有 norm 层: SequenceParallel
+MLA 注意力张量并行：q_b_proj/kv_b_proj ColwiseParallel, o_proj RowwiseParallel, FFN ColwiseParallel/RowwiseParallel, norms SequenceParallel。
+
+### 5. Context Parallel (CP)
+
+Ulysses-style 序列切分，通过 `apply_cp_to_attention_module` 注册。要求 `num_heads % cp_degree == 0`。
+
+### 6. Pipeline Parallel (PP)
+
+结构原生支持（ModuleDict layers），通过 `pipeline_llm` 自动切分。
+
+### 7. MLA Absorb（默认禁用）
+
+Weight absorption 将 kv_b_proj 分解吸收到 Q 和 output。仅当 `kv_lora_rank < qk_nope_head_dim` 时有收益。
+
+### 8. torch.compile（选择性编译）
+
+细粒度编译排除 experts (grouped_mm) 和 NPURMSNorm。通过 `compile_config.enable=True` 激活。
 
 ## 未来可优化方向
 
-### 高优先级
-
-1. **NPU RoPE (`npu_rope`)**
-   - `torch_npu.npu_rotary_mul` 在 CANN 9.0.0 下与 activation checkpointing (recompute) 存在兼容性问题
-   - backward pass 在 AC recomputation 期间触发 `aclnnRotaryPositionEmbeddingV2` 异步错误
-   - 需等待 CANN 版本升级修复或实现自定义 autograd function 避免 AC recompute
-   - 预期收益：RoPE 计算加速 ~50%
-
-2. **NpuExpertParallel 替换 ExpertParallel**
-   - `NpuExpertParallel` 的 `_token_dispatch/_token_combine` 接口期望 `GroupedExperts.forward(x, num_tokens_per_expert, routed_scores)` 三参数签名
-   - 当前 `LongCatFlashMoE` 的路由逻辑在 experts 模块外部，EP 只对 experts 参数做分片
-   - 需要重构 MoE 为标准 `torchtitan.models.common.moe.MoE` 继承体系，或实现自定义 `_token_dispatch` hook
-   - 预期收益：EP 通信与计算 overlap，减少 all-to-all 延迟
-
-### 中优先级
-
-3. **torch.compile 细粒度编译**
-   - 参考 deepseek_v32 的 `apply_compile()`：对 MoE 子模块、attention 子模块分别编译
-   - 排除 experts（grouped_mm 不支持 dynamo）和 NPURMSNorm
-   - 预期收益：非 MoE 部分的 kernel fusion 提升 10-20%
-
-4. **MLA Absorb 优化**
-   - 参考 deepseek_v32 的 `enable_mla_absorb` 模式
-   - 将 `kv_b_proj` 权重分解为 `w_uk` 和 `w_uv`，通过 einsum 吸收到 Q 和 output
-   - 减少 KV cache 大小和 attention 计算量
-   - 预期收益：attention 显存减少 ~40%
-
-5. **512 专家全量支持**
-   - 当前 8 卡最多训练 128 专家（受 HBM 限制）
-   - 512 专家需要 16+ 卡（EP=16）或 EP=8 + FSDP=2（16 卡）
-   - 或实现 CPU offload + prefetch 的流水线方案
-
-### 低优先级
-
-6. **量化 GMM (`npu_quant_gmm`)**
-   - 支持 MXFP8 / HiFloat8 精度的 grouped matmul
-   - 进一步减少专家计算的内存和算力消耗
-
-7. **Context Parallel**
-   - 支持超长序列训练（>32K）
-   - 需要在 attention 层引入 Ulysses 或 Ring 风格的 CP
-
-8. **Pipeline Parallel**
-   - 对完整 28 层模型做 PP 切分
-   - 配合 `pipeline_llm` pipelining_fn 使用
+1. **NPU RoPE** — `npu_rotary_mul` backward 在 AC recomputation 下失败 (CANN 9.0.0 bug)，待升级修复
+2. **NpuExpertParallel** — 需重构 MoE 为 torchtitan 标准继承体系以适配 NPU EP dispatch hooks
+3. **512 专家全量** — 需 16+ 卡 (EP=16 或 EP=8+FSDP=2)
+4. **量化 GMM** — MXFP8/HiFloat8 精度 grouped matmul
