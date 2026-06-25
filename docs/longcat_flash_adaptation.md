@@ -136,11 +136,11 @@ python3 -m torchtitan_npu.entry \
 | 模型 | debug_8npu (128 experts, 2 layers) |
 | 参数量 | 12.5B |
 | 并行策略 | EP=8 + FSDP + AC(full) + npu_rms_norm + npu_moe_dispatch |
-| Loss (10步) | 12.31 → 8.30 |
-| 内存/卡 | 37.69 GiB (61.5%) |
-| 速度 | ~2.56s/step |
-| TFLOPS | 114 |
-| MFU | 32.3% |
+| Loss (10步) | 12.35 → 8.32 |
+| 内存/卡 | 37.46 GiB (61.1%) |
+| 速度 | ~2.27s/step |
+| TFLOPS | 129 |
+| MFU | 36.5% |
 
 ## 已实施的性能优化
 
@@ -174,16 +174,16 @@ python3 -m torchtitan_npu.entry \
 ### 高优先级
 
 1. **NPU RoPE (`npu_rope`)**
-   - 当前使用 Python 实现的 `apply_rotary_pos_emb_mla`
-   - MLA 的 RoPE 使用 doubled cos/sin 格式 `(seq, 2*dim)`，与 `npu_rotary_mul` 要求的 `(seq, dim//2)` 不兼容
-   - 需要重构 RoPE 预计算为 non-doubled 格式，并使用 `npu_rotary_mul` 的 default mode
+   - `torch_npu.npu_rotary_mul` 在 CANN 9.0.0 下与 activation checkpointing (recompute) 存在兼容性问题
+   - backward pass 在 AC recomputation 期间触发 `aclnnRotaryPositionEmbeddingV2` 异步错误
+   - 需等待 CANN 版本升级修复或实现自定义 autograd function 避免 AC recompute
    - 预期收益：RoPE 计算加速 ~50%
 
 2. **NpuExpertParallel 替换 ExpertParallel**
-   - 当前 EP 使用 vanilla `ExpertParallel`，all-to-all dispatch 走 Python
-   - 可用 `NpuExpertParallel` 的 `npu_moe_re_routing` 做 EP rerouting
-   - 需要在 parallelize.py 中将 `ExpertParallel()` 替换为 `NpuExpertParallel()`
-   - 预期收益：EP 通信与计算 overlap
+   - `NpuExpertParallel` 的 `_token_dispatch/_token_combine` 接口期望 `GroupedExperts.forward(x, num_tokens_per_expert, routed_scores)` 三参数签名
+   - 当前 `LongCatFlashMoE` 的路由逻辑在 experts 模块外部，EP 只对 experts 参数做分片
+   - 需要重构 MoE 为标准 `torchtitan.models.common.moe.MoE` 继承体系，或实现自定义 `_token_dispatch` hook
+   - 预期收益：EP 通信与计算 overlap，减少 all-to-all 延迟
 
 ### 中优先级
 
