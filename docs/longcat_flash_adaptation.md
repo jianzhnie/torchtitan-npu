@@ -133,7 +133,7 @@ python3 -m torchtitan_npu.entry \
 
 | 指标 | 值 |
 |------|-----|
-| 模型 | debug_8npu (128 experts, 2 layers) |
+| 模型 | debug_8npu (128 experts, 2 layers, dim=6144) |
 | 参数量 | 12.5B |
 | 并行策略 | EP=8 + FSDP + AC(full) + npu_rms_norm + npu_moe_dispatch |
 | Loss (10步) | 12.35 → 8.32 |
@@ -141,6 +141,17 @@ python3 -m torchtitan_npu.entry \
 | 速度 | ~2.27s/step |
 | TFLOPS | 129 |
 | MFU | 36.5% |
+
+### 性能演进对比
+
+| 优化阶段 | 配置 | 内存/卡 | 速度 | TFLOPS | MFU |
+|----------|------|---------|------|--------|-----|
+| 基线 (无优化) | debug(16 experts, 4 layers), EP=0, FSDP=8 | 39.89 GiB | 2.05s | 73 | 20.6% |
+| +w13 融合 +npu_rms_norm | debug_8npu(128 experts), EP=8 | 38.74 GiB | 2.65s | 110 | 31.1% |
+| +npu_moe_token_permute/unpermute | debug_8npu(128 experts), EP=8 | 37.46 GiB | 2.27s | 129 | **36.5%** |
+
+> 注：基线配置 (16 experts) 参数量较小 (6.56B)，MoE 计算占比低，MFU 不直接可比。
+> 128 experts 配置 (12.5B) 更接近实际使用场景，优化带来的 MFU 提升从 31.1% → 36.5% (+17%)。
 
 ## 已实施的性能优化
 
