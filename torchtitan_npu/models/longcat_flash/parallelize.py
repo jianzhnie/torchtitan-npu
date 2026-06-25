@@ -41,6 +41,9 @@ def parallelize_longcat_flash(
     if parallel_dims.ep_enabled:
         _apply_expert_parallel(model, parallel_dims)
 
+    if parallel_dims.cp_enabled:
+        _apply_context_parallel(model, parallel_dims)
+
     apply_ac(model, ac_config)
 
     if compile_config.enable:
@@ -205,3 +208,36 @@ def _apply_compile(model: LongCatFlashModel, compile_config: CompileConfig) -> N
                 submod.compile(**compile_kwargs)
 
     logger.info("Applied selective torch.compile (excluded: experts, NPURMSNorm)")
+
+
+def _apply_context_parallel(
+    model: LongCatFlashModel,
+    parallel_dims: ParallelDims,
+) -> None:
+    """Apply Ulysses-style Context Parallel to MLA attention modules."""
+    from torchtitan_npu.distributed.context_parallel.registry import (
+        apply_cp_to_attention_module,
+    )
+
+    cp_mesh = parallel_dims.get_mesh("cp")
+    cp_degree = parallel_dims.cp
+
+    first_layer = next(iter(model.layers.values()))
+    num_heads = first_layer.self_attn[0].num_heads
+    if num_heads % cp_degree != 0:
+        raise ValueError(
+            f"[Ulysses CP] num_heads={num_heads} must be divisible by "
+            f"context_parallel_degree={cp_degree}."
+        )
+
+    attention_modules = []
+    for layer in model.layers.values():
+        for attn in layer.self_attn:
+            attention_modules.append(attn)
+
+    apply_cp_to_attention_module(attention_modules, cp_mesh)
+    logger.info(
+        "Applied Context Parallel (CP=%d) to %d attention modules",
+        cp_degree,
+        len(attention_modules),
+    )
