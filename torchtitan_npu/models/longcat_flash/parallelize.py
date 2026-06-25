@@ -44,8 +44,7 @@ def parallelize_longcat_flash(
     apply_ac(model, ac_config)
 
     if compile_config.enable:
-        for layer in model.layers.values():
-            layer.compile(**compile_config.torch_compile_kwargs)
+        _apply_compile(model, compile_config)
 
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
         dp_mesh_names = (
@@ -161,3 +160,48 @@ def _apply_expert_parallel(
     logger.info(
         "Applied Expert Parallel (EP=%d) to MoE experts", parallel_dims.ep
     )
+
+
+def _apply_compile(model: LongCatFlashModel, compile_config: CompileConfig) -> None:
+    """Apply torch.compile per-submodule with selective exclusions.
+
+    Excluded modules:
+    - MoE experts (grouped_mm not supported by dynamo)
+    - NPURMSNorm (fused kernel, no benefit from compile)
+    """
+    import torch._dynamo
+
+    torch._dynamo.config.capture_scalar_outputs = True
+
+    try:
+        from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
+    except ImportError:
+        NPURMSNorm = None
+
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        CheckpointWrapper,
+    )
+
+    from .model import LongCatFlashExperts, LongCatFlashMoE
+
+    compile_kwargs = {"backend": compile_config.backend, "fullgraph": True}
+
+    for _layer_id, transformer_block in model.layers.items():
+        block = transformer_block
+        if isinstance(block, CheckpointWrapper):
+            block = block._checkpoint_wrapped_module
+
+        for attr_name, submod in block.named_children():
+            if isinstance(submod, LongCatFlashMoE):
+                for moe_attr, moe_child in submod.named_children():
+                    if isinstance(moe_child, LongCatFlashExperts):
+                        continue
+                    if NPURMSNorm and isinstance(moe_child, NPURMSNorm):
+                        continue
+                    moe_child.compile(**compile_kwargs)
+            elif NPURMSNorm and isinstance(submod, NPURMSNorm):
+                continue
+            else:
+                submod.compile(**compile_kwargs)
+
+    logger.info("Applied selective torch.compile (excluded: experts, NPURMSNorm)")

@@ -111,6 +111,7 @@ class LongCatFlashMLA(Module):
             self.mla_scale_kv_lora = (args.dim / args.kv_lora_rank) ** 0.5
 
         self.scaling = qk_head_dim ** (-0.5)
+        self.enable_mla_absorb = False
 
     def forward(
         self,
@@ -119,41 +120,86 @@ class LongCatFlashMLA(Module):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.shape
-        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
         q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         q_states = q_states.view(batch_size, seq_length, self.num_heads, qk_head_dim).transpose(1, 2)
-        q_pass, q_rot = q_states.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope, q_rot = q_states.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         if self.mla_scale_q_lora is not None:
-            q_pass = q_pass * self.mla_scale_q_lora
+            q_nope = q_nope * self.mla_scale_q_lora
             q_rot = q_rot * self.mla_scale_q_lora
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pass, k_rot = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pass = self.kv_a_layernorm(k_pass)
+        kv_latent, k_rot = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_latent = self.kv_a_layernorm(kv_latent)
 
         if self.mla_scale_kv_lora is not None:
-            k_pass = k_pass * self.mla_scale_kv_lora
-
-        k_pass = self.kv_b_proj(k_pass)
-        key_shape = (batch_size, seq_length, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_pass = k_pass.view(key_shape).transpose(1, 2)
-        k_pass, value_states = k_pass.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            kv_latent = kv_latent * self.mla_scale_kv_lora
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
         q_rot, k_rot = apply_rotary_pos_emb_mla(q_rot, k_rot, cos, sin)
         k_rot = k_rot.expand(-1, self.num_heads, -1, -1)
 
-        query_states = torch.cat([q_pass, q_rot], dim=-1)
+        if self.enable_mla_absorb:
+            attn_output = self._forward_absorb(
+                q_nope, q_rot, kv_latent, k_rot, batch_size, seq_length
+            )
+        else:
+            attn_output = self._forward_standard(
+                q_nope, q_rot, kv_latent, k_rot, batch_size, seq_length
+            )
+
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, -1)
+        return self.o_proj(attn_output)
+
+    def _forward_absorb(
+        self, q_nope, q_rot, kv_latent, k_rot, batch_size, seq_length,
+    ) -> torch.Tensor:
+        """MLA with weight absorption — avoids expanding kv_b_proj to full heads."""
+        wkv_b = self.kv_b_proj.weight.reshape(
+            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        )
+        w_uk = wkv_b[:, :self.qk_nope_head_dim, :]
+        w_uv = wkv_b[:, self.qk_nope_head_dim:, :]
+        w_uv_t = w_uv.permute(0, 2, 1).contiguous()
+
+        q_nope = torch.einsum(
+            "bhsq,hqr->bhsr", q_nope, w_uk
+        )
+
+        k_nope = kv_latent.unsqueeze(1)
+        v = kv_latent.unsqueeze(1)
+
+        query_states = torch.cat([q_nope, q_rot], dim=-1)
+        key_states = torch.cat([k_nope.expand(-1, self.num_heads, -1, -1), k_rot], dim=-1)
+
+        absorb_scaling = (self.kv_lora_rank + self.qk_rope_head_dim) ** (-0.5)
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, v.expand(-1, self.num_heads, -1, -1),
+            is_causal=True, scale=absorb_scaling,
+        )
+
+        attn_output = torch.einsum("bhsr,hrv->bhsv", attn_output, w_uv_t)
+        return attn_output
+
+    def _forward_standard(
+        self, q_nope, q_rot, kv_latent, k_rot, batch_size, seq_length,
+    ) -> torch.Tensor:
+        """Standard MLA — expands kv_b_proj fully."""
+        k_pass = self.kv_b_proj(kv_latent)
+        key_shape = (batch_size, seq_length, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_pass = k_pass.view(key_shape).transpose(1, 2)
+        k_pass, value_states = k_pass.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        query_states = torch.cat([q_nope, q_rot], dim=-1)
         key_states = torch.cat([k_pass, k_rot], dim=-1)
 
         attn_output = F.scaled_dot_product_attention(
             query_states, key_states, value_states,
             is_causal=True, scale=self.scaling,
         )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, -1)
-        return self.o_proj(attn_output)
+        return attn_output
 
 class LongCatFlashExperts(Module):
     @dataclass(kw_only=True, slots=True)
