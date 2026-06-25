@@ -312,7 +312,44 @@ Weight absorption 将 kv_b_proj 分解吸收到 Q 和 output。仅当 `kv_lora_r
 
 ## 未来可优化方向
 
-1. **NPU RoPE** — `npu_rotary_mul` backward 在 AC recomputation 下失败 (CANN 9.0.0 bug)，待升级修复
-2. **NpuExpertParallel** — 需重构 MoE 为 torchtitan 标准继承体系以适配 NPU EP dispatch hooks
-3. **512 专家全量** — 需 16+ 卡 (EP=16 或 EP=8+FSDP=2)
-4. **量化 GMM** — MXFP8/HiFloat8 精度 grouped matmul
+### 1. NPU RoPE (`npu_rotary_mul`)
+
+**状态：** 已调查，CANN 9.0.0 不兼容
+
+`torch_npu.npu_rotary_mul` 的 forward 在所有 `qk_rope_head_dim ≤ 64` 下正常工作，但 **backward 在 activation checkpointing recomputation 期间失败**（`aclnnRotaryPositionEmbeddingV2` 异步错误）。
+
+**根因：** CANN 9.0.0 的 rotary backward kernel 与 PyTorch AC dispatcher 交互时触发内部错误。
+
+**解决方案：** 等待 CANN 升级修复，或实现自定义 `torch.autograd.Function` 避免 AC 对 rotary backward 的重计算。
+
+### 2. NpuExpertParallel
+
+**状态：** 已调查，架构不兼容，需完整重构
+
+`NpuExpertParallel` 设计为替代整个 token dispatch 流程（通过 `_token_dispatch` / `_token_combine` hooks），但 LongCat-Flash 的 MoE 有独特的 **zero-expert identity routing** 且已在 MoE forward 中做了本地 `npu_moe_token_permute`。
+
+**不兼容的核心矛盾：**
+
+| 维度 | LongCat-Flash 当前实现 | NpuExpertParallel 期望 |
+|------|---|---|
+| Token dispatch 位置 | MoE.forward 内部做 `npu_moe_token_permute` | EP input hook 做全局 all-to-all + `aclnnMoeReRouting` |
+| num_tokens_per_expert | 本地专家数 shape=(16,) | 全局专家数 shape=(128,) 覆盖所有 EP ranks |
+| Expert forward 输入 | 已 permute 好的 local tokens | 原始 routed tokens（EP hook 再次 permute） |
+| Routing scores | 在 `npu_moe_token_unpermute` 的 `probs` 参数中应用 | 作为 3rd arg 传入 experts，EP hook 对其做 all-to-all |
+
+**解决方案（需独立 PR）：**
+1. 将 `LongCatFlashMoE` 重构为继承 `torchtitan.models.common.moe.MoE`
+2. 使用标准 `TokenChoiceTopKRouter` + `TokenReorderer` 做路由
+3. 将 zero-expert identity 逻辑实现为 `shared_experts` 或 post-processing hook
+4. 移除 MoE forward 中的 `npu_moe_token_permute` 调用（让 `NpuExpertParallel` 接管）
+5. 确保 experts forward 签名为 `(x, num_tokens_per_expert, routed_scores=None)`
+
+### 3. 512 专家全量支持
+
+需 16+ 卡。512 experts × 2 layers 的总参数量为 ~80GB (BF16)，8×64GB HBM 在 EP=8 时仍然 OOM（单卡需持有 64 experts ≈ 9.7GB 权重 + 梯度 + activations）。
+
+方案：EP=16 (16 卡) 或 EP=8+FSDP=2 (16 卡) 或 CPU offload pipeline。
+
+### 4. 量化 GMM (`npu_quant_gmm`)
+
+支持 MXFP8 / HiFloat8 精度的 grouped matmul，进一步减少专家计算的内存和算力消耗。
