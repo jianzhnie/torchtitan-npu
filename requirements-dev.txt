@@ -2,7 +2,7 @@ pytest==8.3.2
 pytest-cov
 pre-commit
 pyrefly==0.45.1
-transformers==4.57.6
+transformers==5.10.1
 # Test dependencies
 einops
 expecttest
